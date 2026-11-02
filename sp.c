@@ -21,6 +21,7 @@ ssize_t read_command (int fd, char **out_buf) {
 		char ch;
 		ssize_t n = read(fd, &ch, 1);
 		if (n <= 0) {
+			if (errno == EINTR) continue;
 			if (len == 0) {
 				free(buf);
 				return -1;
@@ -80,6 +81,83 @@ int pending_pop (PendingTable *table, const char *hash) {
 	return -1;
 }
 
+char *run_consultant(const char *consultant_path, const char *key) {
+	if (!consultant_path) return NULL;
+	while (1) {
+		int p2c[2], c2p[2];
+		if (pipe(p2c) < 0) continue;
+		if (pipe(c2p) < 0) {
+			close(p2c[0]); close(p2c[1]);
+			continue;
+		}
+		pid_t pid = fork();
+		if (pid < 0) {
+			close(p2c[0]); close(p2c[1]); close(c2p[0]); close(c2p[1]);
+			continue;
+		}
+
+		if (pid == 0) { // consultant child
+			dup2(p2c[0], STDIN_FILENO);
+			dup2(c2p[1], STDOUT_FILENO);
+			close(p2c[0]); close(p2c[1]); close(c2p[0]); close(c2p[1]);
+
+			execl(consultant_path, consultant_path, (char *)NULL);
+
+			// execl failed -> return
+			exit(EXIT_FAILURE);
+		}
+
+		// parent
+		close(p2c[0]);
+		close(c2p[1]);
+		dprintf(p2c[1], "%s\n", key);
+		close(p2c[1]);
+		char *line = NULL;
+		ssize_t rlen = read_command(c2p[0], &line);
+		close(c2p[0]);
+		int status;
+		waitpid(pid, &status, 0);
+		if (rlen > 0 && line != NULL) {
+			if (strncmp(line, "Ok: ", 4) == 0) {
+				char* val = strdup(line + 4);
+				free(line);
+				return val;
+			}
+			free(line);
+		}
+		// parent failed -> retry
+	}
+}
+
+void kill_handler(ChildNodeSet *children, char *cmd_fifo, char *reply_fifo, KVStore *store, char **consultant_path) {
+  // TODO: Implement the KILL command handler.
+	for (int i = 0; i < children->child_count; i++) {
+		if (children->child[i].write_fd != -1) {
+			if (dprintf(children->child[i].write_fd, "kill\n") < 0) {
+				perror("send kill failed.");
+			}
+			if (close(children->child[i].read_fd) < 0 || close(children->child[i].write_fd) < 0) {
+				perror("close failed.");
+			}
+			children->child[i].read_fd = -1;
+			children->child[i].write_fd = -1;
+		}
+	}
+	for (int i = 0; i < children->child_count; i++) {
+		if (children->child[i].pid > 0) {
+			waitpid(children->child[i].pid, NULL, 0);
+		}
+	}
+
+	if (consultant_path && *consultant_path) {
+		free(*consultant_path);
+		*consultant_path = NULL;
+	}
+	children->child_count = 0;
+	kv_free(store);
+	exit(0);
+}
+
 int main(int argc, char *argv[]) {
 	// TODO: Determine whether the current process is SP main.
   //       After that, you may want to make the following code the same for both
@@ -89,6 +167,7 @@ int main(int argc, char *argv[]) {
 	int reply_fd = STDOUT_FILENO;
 	char *cmd_fifo = NULL;
 	char *reply_fifo = NULL;
+	char *consultant_path = NULL;
 
 	if (argc > 1) {
     cmd_fifo = argv[1];
@@ -103,13 +182,20 @@ int main(int argc, char *argv[]) {
 			return 1;
 		}
 
-		cmd_fd = open(cmd_fifo, O_RDWR | O_CLOEXEC);
-		reply_fd = open(reply_fifo, O_RDWR | O_CLOEXEC);
+		cmd_fd = open(cmd_fifo, O_RDONLY | O_CLOEXEC);
+		reply_fd = open(reply_fifo, O_WRONLY | O_CLOEXEC);
 		if (cmd_fd < 0 || reply_fd < 0) {
 			fprintf(stderr, "open FIFO failed.\n");
 			return 1;
 		}
-  }
+		unlink(cmd_fifo);
+		unlink(reply_fifo);
+  } else {
+		char *env_consultant = getenv("JUDGE_CONSULTANT");
+		if (env_consultant) {
+			consultant_path = strdup(env_consultant);
+		}
+	}
 
 	KVStore store;
 	kv_init(&store);
@@ -155,28 +241,30 @@ int main(int argc, char *argv[]) {
 		}
 
 		if (poll(fds, nfds, -1) < 0) {
+			if (errno == EINTR) continue;
 			perror("poll failed.");
 			break;
 		}
 
-		if (fds[judge_idx].revents & POLLIN) {
+		if (fds[judge_idx].revents & (POLLIN | POLLHUP | POLLERR)) {
 			char *command_buffer = NULL;
 			ssize_t len = read_command(cmd_fd, &command_buffer);
-			if (len <= 0) break;
+			if (len <= 0) {
+				kill_handler(&children, cmd_fifo, reply_fifo, &store, &consultant_path);
+			}
 
 			Command command = {.buf = command_buffer, .len = len, .type = UNKNOWN};
 			classify_command(&command);
-			if (command.type == KILL) {
-				free(command_buffer);
-				break;
-			}
-			command_handler(&command, &store, reply_fd, &children, &table);
+			command_handler(&command, &store, reply_fd, &children, &table, &consultant_path, cmd_fifo, reply_fifo);
 			free(command_buffer);
 		}
 
-		if (parent_idx != -1 && (fds[parent_idx].revents & POLLIN)) {
+		if (parent_idx != -1 && (fds[parent_idx].revents & (POLLIN | POLLHUP | POLLERR))) {
 			char* buf = NULL;
-			read_command(children.parent_read_fd, &buf);
+			ssize_t rlen = read_command(children.parent_read_fd, &buf);
+			if (rlen <= 0) {
+				kill_handler(&children, cmd_fifo, reply_fifo, &store, &consultant_path);
+			}
 			if (strncmp(buf, "RESP ", 5) == 0) {
 				char *resp_hash = buf + 5;
 				char *resp_space_ptr = strchr(resp_hash, ' ');
@@ -217,7 +305,7 @@ int main(int argc, char *argv[]) {
 					return -1;
 				}
 
-				char* req_value = kv_get(&store, req_key);
+				const char* req_value = kv_get(&store, req_key);
 				if (req_value != NULL) { // hit, response to parent
 					if (dprintf(children.parent_write_fd, "RESP %s %s\n", req_hash, req_value) < 0) {
 						perror("response write to parent failed.");
@@ -241,9 +329,20 @@ int main(int argc, char *argv[]) {
 		}
 
 		for (int i = 0; child_fd_start + i < nfds; i++) {
-			if (fds[child_fd_start + i].revents & POLLIN) {
+			if (fds[child_fd_start + i].revents & (POLLIN | POLLHUP | POLLERR)) {
 				char* buf = NULL;
-				read_command(children.child[i].read_fd, &buf);
+				ssize_t rlen = read_command(children.child[i].read_fd, &buf);
+				if (rlen <= 0 || buf == NULL) {
+					close(children.child[i].read_fd);
+					close(children.child[i].write_fd);
+					waitpid(children.child[i].pid, NULL, 0);
+					for (int j = i; j < children.child_count - 1; j++) {
+						children.child[j] = children.child[j + 1];
+					}
+					children.child_count--;
+					if (buf) free(buf);
+					break;
+				}
 				if (strncmp(buf, "REQ ", 4) == 0) {
 					char *req_hash = buf + 4;
 					char *req_space_ptr = strchr(req_hash, ' ');
@@ -258,7 +357,7 @@ int main(int argc, char *argv[]) {
 						return -1;
 					}
 
-					char* req_value = kv_get(&store, req_key);
+					const char* req_value = kv_get(&store, req_key);
 					if (req_value != NULL) { // hit, response to child[i]
 						if (dprintf(children.child[i].write_fd, "RESP %s %s\n", req_hash, req_value) < 0) {
 							perror("response write to children failed.");
@@ -267,7 +366,20 @@ int main(int argc, char *argv[]) {
 					} else { // miss, request parent/consultant
 						if (children.parent_write_fd == -1) {
 							// ask consultant
-							return -1;
+							char *c_val = run_consultant(consultant_path, req_key);
+							if (c_val) {
+								if (dprintf(children.child[i].write_fd, "RESP %s %s\n", req_hash, c_val) < 0) {
+									perror("respond write to child failed.");
+									free(c_val);
+									return 1;
+								}
+								free(c_val);
+							} else {
+								free(c_val);
+								fprintf(stderr, "consultant returned invalid value.\n");
+								return -1;
+							}
+
 						} else {
 							pending_add(&table, req_hash, i);
 							if (dprintf(children.parent_write_fd, "REQ %s %s\n", req_hash, req_key) < 0) {
@@ -321,7 +433,8 @@ int main(int argc, char *argv[]) {
 	return 0;
 }
 
-int command_handler(Command *cmd, KVStore *store, int reply_fd, ChildNodeSet *children, PendingTable *table) {
+int command_handler(Command *cmd, KVStore *store, int reply_fd, ChildNodeSet *children, PendingTable *table,
+										char **consultant_path, char *cmd_fifo, char *reply_fifo) {
   switch (cmd->type) {
   case CREATE:
     create_handler(cmd->buf, cmd->len, store, children);
@@ -333,13 +446,13 @@ int command_handler(Command *cmd, KVStore *store, int reply_fd, ChildNodeSet *ch
     delete_handler(cmd->buf, cmd->len, store);
     break;
   case FETCH:
-    fetch_handler(cmd->buf, cmd->len, store, reply_fd, children, table);
+    fetch_handler(cmd->buf, cmd->len, store, reply_fd, children, table, consultant_path);
     break;
   case KILL:
-    kill_handler(cmd->buf, cmd->len, store);
+    kill_handler(children, cmd_fifo, reply_fifo, store, consultant_path);
     break;
   case UPDATE:
-    update_handler(cmd->buf, cmd->len, store);
+    update_handler(cmd->buf, cmd->len, consultant_path);
     break;
   default:
     fprintf(stderr, "Unknown command type\n");
@@ -399,9 +512,9 @@ int create_handler(char *buf, size_t len, KVStore *store, ChildNodeSet *children
 		execv("./sp", child_argv);
 
 		// execv returned -> failed
-		close(p2c[0]); close(p2c[1]); close(c2p[0]); close(c2p[1]);
+		close(p2c[0]); close(c2p[1]);
 		perror("execv failed.");
-		return -1;
+		exit(EXIT_FAILURE);
 
 	} else { // parent process
 		if (close(p2c[0]) < 0 || close(c2p[1]) < 0) {
@@ -463,7 +576,8 @@ int delete_handler(char *buf, size_t len, KVStore *store) {
 	return 0;
 }
 
-int fetch_handler(char *buf, size_t len, KVStore *store, int reply_fd, ChildNodeSet* children, PendingTable *table) {
+int fetch_handler(char *buf, size_t len, KVStore *store, int reply_fd, ChildNodeSet *children, PendingTable *table,
+									char **consultant_path) {
   // TODO: Implement the FETCH command handler.
 	if (len < 8 || strncmp(buf, "fetch ", 6) != 0) {
 		fprintf(stderr, "Invalid fetch command.\n");
@@ -491,18 +605,24 @@ int fetch_handler(char *buf, size_t len, KVStore *store, int reply_fd, ChildNode
 		return 0;
 	}
 	
-	pending_add(table, hash, -1);
-	
 	if (children->parent_write_fd != -1) {
+		pending_add(table, hash, -1);
 		if (dprintf(children->parent_write_fd, "REQ %s %s\n", hash, key) < 0) {
 			perror("request write to parent failed.");
 			return -1;
 		}
-	}
-	
-	for (int i = 0; i < children->child_count; i++) {
-		if (dprintf(children->child[i].write_fd, "REQ %s %s\n", hash, key) < 0) {
-			perror("request write to child failed.");
+	} else {
+		// ask consultant
+		char *c_val = run_consultant(*consultant_path, key);
+		if (c_val) {
+			if (dprintf(reply_fd, "%s %s\n", hash, c_val) < 0) {
+				perror("respond write to reply_fd failed.");
+				return -1;
+			}
+			free(c_val);
+		} else {
+			free(c_val);
+			fprintf(stderr, "consulant returned invalid value.\n");
 			return -1;
 		}
 	}
@@ -510,10 +630,22 @@ int fetch_handler(char *buf, size_t len, KVStore *store, int reply_fd, ChildNode
 	return 0;
 }
 
-int kill_handler(char *buf, size_t len, KVStore *store) {
-  // TODO: Implement the KILL command handler.
-}
-
-int update_handler(char *buf, size_t len, KVStore *store) {
+int update_handler(char *buf, size_t len, char **consultant_path) {
   // TODO: Implement the UPDATE command handler.
+	if (len < 8 || strncmp(buf, "update ", 7) != 0) {
+		fprintf(stderr, "Invalid update command.\n");
+		return -1;
+	}
+	char *path = buf + 7;
+	if (*path == '\0') {
+		fprintf(stderr, "Invalid path in update command.\n");
+		return -1;
+	}
+
+	struct stat st;
+	if (stat(path, &st) == 0 && S_ISREG(st.st_mode) && access(path, X_OK) == 0) {
+		if (*consultant_path) free(*consultant_path);
+		*consultant_path = strdup(path);
+	}
+	return 0;
 }

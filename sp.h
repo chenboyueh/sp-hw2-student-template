@@ -27,7 +27,7 @@ typedef struct {
   int origin_fd;  // judge = -1; parent = -2
 } PendingFetch;
 
-#define MAX_PENDING 128
+#define MAX_PENDING 1024
 
 typedef struct {
   PendingFetch requests[MAX_PENDING];
@@ -41,12 +41,12 @@ typedef struct {
   enum { CREATE, STORE, DELETE, FETCH, KILL, UPDATE, UNKNOWN } type;
 } Command;
 
-int command_handler(Command *cmd, KVStore *store, int reply_fd, ChildNodeSet *children, PendingTable *table);
+int command_handler(Command *cmd, KVStore *store, int reply_fd, ChildNodeSet *children, PendingTable *table, char **consultant_path, char *cmd_fifo, char *reply_fifo);
 int create_handler(char *buf, size_t len, KVStore *store, ChildNodeSet *children);
 int store_handler(char *buf, size_t len, KVStore *store);
 int delete_handler(char *buf, size_t len, KVStore *store);
-int fetch_handler(char *buf, size_t len, KVStore *store, int reply_fd, ChildNodeSet *children, PendingTable *table);
-int kill_handler(char *buf, size_t len, KVStore *store);
-int update_handler(char *buf, size_t len, KVStore *store);
+int fetch_handler(char *buf, size_t len, KVStore *store, int reply_fd, ChildNodeSet *children, PendingTable *table, char **consultant_path);
+void kill_handler(ChildNodeSet *children, char *cmd_fifo, char *reply_fifo, KVStore *store, char **consultant_path);
+int update_handler(char *buf, size_t len, char **consultant_path);
 
 #endif // SP_H
